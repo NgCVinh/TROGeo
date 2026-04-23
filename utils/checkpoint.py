@@ -12,6 +12,9 @@ def save_checkpoint(state, is_best, args, filename='default'):
 
     checkpoint_name = './saved_models/%s_checkpoint.pth.tar'%(filename)
     best_name = './saved_models/%s_model_best.pth.tar'%(filename)
+
+    os.makedirs(os.path.dirname(checkpoint_name), exist_ok=True)
+    
     torch.save(state, checkpoint_name)
     if is_best:
         shutil.copyfile(checkpoint_name, best_name)

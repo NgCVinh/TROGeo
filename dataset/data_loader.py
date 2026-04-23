@@ -101,7 +101,7 @@ class RSDataset(Dataset):
         mask_rsimg = (mask_rsimg > 127).astype(np.float32)
 
         if self.augment:
-            rs_transformed = self.rs_transform(image=rsimg, bboxes=[list(bbox) + [cls_name]], mask=mask_rsimg)
+            rs_transformed = self.rs_transform(image=rsimg, bboxes=[list(bbox)], mask=mask_rsimg)
             rsimg = rs_transformed['image']
             bbox = rs_transformed['bboxes'][0][0:4]
             mask_rsimg = rs_transformed['mask']

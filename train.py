@@ -23,6 +23,7 @@ from model.TROGeo import TROGeo
 from model.loss import yolo_loss, build_target, adjust_learning_rate
 from utils.utils import AverageMeter, eval_iou_acc
 from utils.checkpoint import save_checkpoint, load_pretrain
+from utils.visualize import visualize_worst_batch
 
 from model.loss import Mask_DC_and_BCE_lossV2
 
@@ -183,7 +184,7 @@ def train_epoch(train_loader, model, optimizer, epoch, criterion, args):
 
         pred_anchor, pred_coords = model(query_imgs, rs_imgs, mat_clickxy)
 
-        pred_anchor = pred_anchor.view(pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3])
+        pred_anchor = pred_anchor.view(pred_anchor.shape[0], 9, 9, pred_anchor.shape[2], pred_anchor.shape[3])
         
         ## convert gt box to center+offset format
         new_gt_bbox, best_anchor_gi_gj = build_target(ori_gt_bbox, anchors_full, args.img_size, pred_anchor.shape[3])
@@ -250,7 +251,7 @@ def test_epoch(data_loader, model, args):
 
         with torch.no_grad():
             pred_anchor, pred_coords = model(query_imgs, rs_imgs, mat_clickxy)
-        pred_anchor = pred_anchor.view(pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3])
+        pred_anchor = pred_anchor.view(pred_anchor.shape[0], 9, 9, pred_anchor.shape[2], pred_anchor.shape[3])
         
         _, best_anchor_gi_gj = build_target(ori_gt_bbox, anchors_full, args.img_size, pred_anchor.shape[3])
         

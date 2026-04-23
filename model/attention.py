@@ -303,3 +303,93 @@ class SpatialTransformer(nn.Module):
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
         x = self.proj_out(x)
         return x + x_in
+
+class FeatureGating(nn.Module):
+    """
+    Module Gating: Lọc các đặc trưng của Reference dựa trên Query.
+    Sử dụng cơ chế channel reduction để giảm thiểu chi phí tính toán.
+    """
+    def __init__(self, in_channels):
+        super(FeatureGating, self).__init__()
+        reduced_channels = in_channels // 4
+        
+        # Giảm chiều channel để trích xuất đặc trưng quan trọng
+        self.conv_query = nn.Conv2d(in_channels, reduced_channels, kernel_size=1)
+        self.conv_ref = nn.Conv2d(in_channels, reduced_channels, kernel_size=1)
+        
+        # Mạng CNN nhỏ để học Spatial Mask (B, 1, H, W)
+        self.gate_conv = nn.Sequential(
+            nn.Conv2d(reduced_channels * 2, reduced_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(reduced_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(reduced_channels, 1, kernel_size=1),
+            nn.Sigmoid() # Ép giá trị mask về khoảng [0, 1]
+        )
+
+    def forward(self, query, reference):
+        # query, reference shape: [B, C, H, W]
+        q_feat = self.conv_query(query)
+        r_feat = self.conv_ref(reference)
+        # FIX LỖI: Resize q_feat để khớp kích thước với r_feat (H2, W2)
+        if q_feat.shape[2:] != r_feat.shape[2:]:
+            q_feat = F.interpolate(q_feat, size=r_feat.shape[2:], mode='bilinear', align_corners=False)
+        # Ghép đặc trưng (Concatenation) để mô hình tự học sự tương quan
+        combined = torch.cat([q_feat, r_feat], dim=1) # [B, C/2, H, W]
+        
+        # Tính toán bản đồ trọng số không gian (Spatial Gate)
+        gate = self.gate_conv(combined) # [B, 1, H, W]
+        
+        # Áp dụng mask lên reference ban đầu (Element-wise multiplication)
+        # Các vùng không quan trọng (gate ~ 0) sẽ bị triệt tiêu tín hiệu
+        gated_reference = reference * gate
+        
+        return gated_reference
+
+class LearnablePolarTransform(nn.Module):
+    def __init__(self, in_channels):
+        super(LearnablePolarTransform, self).__init__()
+        # Mạng dự đoán tâm biến đổi Polar (cx, cy)
+        self.center_predictor = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(in_channels, in_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // 4, 2),
+            nn.Sigmoid() # Ép tọa độ tâm về khoảng [0, 1]
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        
+        # 1. Dự đoán tâm (cx, cy)
+        centers = self.center_predictor(x)
+        cx = centers[:, 0].view(B, 1, 1) * W
+        cy = centers[:, 1].view(B, 1, 1) * H
+
+        # 2. Tạo lưới tọa độ Cartesian
+        y_grid, x_grid = torch.meshgrid(
+            torch.arange(H, device=x.device), 
+            torch.arange(W, device=x.device), 
+            indexing='ij'
+        )
+        y_grid = y_grid.float().unsqueeze(0).expand(B, -1, -1)
+        x_grid = x_grid.float().unsqueeze(0).expand(B, -1, -1)
+
+        # 3. Chuyển đổi sang hệ tọa độ Polar (r, theta) tương đối với tâm
+        dx = x_grid - cx
+        dy = y_grid - cy
+        r = torch.sqrt(dx**2 + dy**2)
+        theta = torch.atan2(dy, dx)
+
+        # 4. Chuẩn hóa lưới Polar về [-1, 1] để dùng hàm grid_sample của PyTorch
+        max_r = math.sqrt(H**2 + W**2)
+        r_norm = (r / max_r) * 2 - 1
+        theta_norm = theta / math.pi # Chuyển từ [-pi, pi] sang [-1, 1]
+
+        # Lưới chuẩn hóa cho grid_sample [B, H, W, 2]
+        polar_grid = torch.stack([theta_norm, r_norm], dim=-1) 
+
+        # 5. Lấy mẫu lại đặc trưng (Resampling feature)
+        polar_feat = F.grid_sample(x, polar_grid, align_corners=False, mode='bilinear')
+        
+        return polar_feat

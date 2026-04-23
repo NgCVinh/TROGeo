@@ -1,0 +1,30 @@
+# Dataset
+
+dataset/*
+
+
+!dataset/data_loader.py
+dataset/CVOGL_DroneAerial/
+dataset/*.zip
+dataset/*.pth
+
+# Model weights
+saved_models/
+*.pth
+*.pt
+*.tar
+
+# Cache
+__pycache__/
+*.pyc
+
+# Debug / visualization
+debug_vis/
+
+# Logs
+*.log
+runs/
+
+# OS / IDE
+.vscode/
+.DS_Store

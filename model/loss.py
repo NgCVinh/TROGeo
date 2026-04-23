@@ -21,7 +21,6 @@ def yolo_loss(predictions, gt_bboxes, anchors_full, best_anchor_gi_gj, image_wh)
     batch_size, grid_stride = predictions.shape[0], image_wh // predictions.shape[3]
     best_anchor, gi, gj = best_anchor_gi_gj[:, 0], best_anchor_gi_gj[:, 1], best_anchor_gi_gj[:, 2]
     scaled_anchors = anchors_full / grid_stride
-    mseloss = torch.nn.MSELoss(reduction='mean')
     celoss_confidence = torch.nn.CrossEntropyLoss(reduction='mean')
     #celoss_cls = torch.nn.CrossEntropyLoss(size_average=True)
 
@@ -29,13 +28,23 @@ def yolo_loss(predictions, gt_bboxes, anchors_full, best_anchor_gi_gj, image_wh)
 
     #---bbox loss---
     pred_bboxes = torch.zeros_like(gt_bboxes)
-    pred_bboxes[:, 0:2] = selected_predictions[:, 0:2].sigmoid()
-    pred_bboxes[:, 2:4] = selected_predictions[:, 2:4]
+    pred_bboxes[:, 0:2] = selected_predictions[:, 0:2].sigmoid() # x, y
+    pred_bboxes[:, 2:4] = selected_predictions[:, 2:4] # w, h
+
+    # 4 tham số tiếp theo là log(variance) của x, y, w, h
+    log_vars = selected_predictions[:, 5:9]
+
+    # Hàm Gaussian / KL Loss
+    # L_reg = 0.5 * exp(-log_var) * (pred - gt)^2 + 0.5 * log_var
+    def gaussian_nll_loss(pred, target, log_variance):
+        # Tránh nổ gradient (Clamp log_variance)
+        log_variance = torch.clamp(log_variance, min=-4.0, max=4.0)
+        return (torch.exp(-log_variance) * (pred - target)**2 + log_variance) * 0.5
     
-    loss_x = mseloss(pred_bboxes[:,0], gt_bboxes[:,0])
-    loss_y = mseloss(pred_bboxes[:,1], gt_bboxes[:,1])
-    loss_w = mseloss(pred_bboxes[:,2], gt_bboxes[:,2])
-    loss_h = mseloss(pred_bboxes[:,3], gt_bboxes[:,3])
+    loss_x = gaussian_nll_loss(pred_bboxes[:,0], gt_bboxes[:,0], log_vars[:,0]).mean()
+    loss_y = gaussian_nll_loss(pred_bboxes[:,1], gt_bboxes[:,1], log_vars[:,1]).mean()
+    loss_w = gaussian_nll_loss(pred_bboxes[:,2], gt_bboxes[:,2], log_vars[:,2]).mean()
+    loss_h = gaussian_nll_loss(pred_bboxes[:,3], gt_bboxes[:,3], log_vars[:,3]).mean()
 
     loss_bbox = loss_x + loss_y + loss_w + loss_h
 

@@ -176,25 +176,46 @@ def train_epoch(train_loader, model, optimizer, epoch, criterion, args):
         ori_gt_bbox = ori_gt_bbox.cuda()
         ori_gt_bbox = torch.clamp(ori_gt_bbox, min=0, max=args.img_size-1)
 
-        mask_rsimg = mask_rsimg.unsqueeze(1)
         # coords_gt = nn.AvgPool2d(16, stride=16)(mask_rsimg)
         coords_gt = nn.MaxPool2d(16, stride=16)(mask_rsimg)
         coords_gt = coords_gt.cuda()
 
-        pred_anchor, pred_coords = model(query_imgs, rs_imgs, mat_clickxy)
+        # 1. Gọi model, nhận về outbox và một LIST 3 kết quả refinement
+        pred_anchor, coords_list = model(query_imgs, rs_imgs, mat_clickxy)
 
         pred_anchor = pred_anchor.view(pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3])
         
+        # 2. Xử lý Ground Truth (GT) cho mask
+        with torch.no_grad():
+            mask_rsimg = mask_rsimg.unsqueeze(1).cuda()
+            # Lấy kích thước từ phần tử cuối cùng trong list
+            output_h, output_w = coords_list[-1].shape[2], coords_list[-1].shape[3]
+            
+            # Dùng AdaptiveMaxPool2d để giữ lại điểm mục tiêu an toàn nhất
+            pool_layer = nn.AdaptiveMaxPool2d((output_h, output_w))
+            coords_gt = pool_layer(mask_rsimg)
+
         ## convert gt box to center+offset format
         new_gt_bbox, best_anchor_gi_gj = build_target(ori_gt_bbox, anchors_full, args.img_size, pred_anchor.shape[3])
         
-        # loss
+        # 3. Tính Loss
+        # YOLO loss cho Bounding Box
         loss_geo, loss_cls = yolo_loss(pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, args.img_size)
-        loss = loss_cls + loss_geo * args.beta + criterion(pred_coords, coords_gt) * 2.
+        
+        # Multi-step Mask Loss (Deep Supervision)
+        loss_mask = 0
+        # Duyệt qua từng bước dự đoán (Coarse -> Fine) và cộng dồn loss
+        for step_pred in coords_list:
+            loss_mask += criterion(step_pred, coords_gt)
+            
+        # Chia trung bình cho số bước (3 bước) để loss không bị quá to
+        loss_mask = loss_mask / len(coords_list)
+
+        # Tổng hợp Loss
+        loss = loss_cls + loss_geo * args.beta + loss_mask * 2.0
 
         optimizer.zero_grad()
         loss.backward()
-
         optimizer.step()
 
         avg_losses.update(loss.item(), query_imgs.shape[0])
@@ -249,7 +270,11 @@ def test_epoch(data_loader, model, args):
         ori_gt_bbox = torch.clamp(ori_gt_bbox, min=0, max=args.img_size-1)
 
         with torch.no_grad():
-            pred_anchor, pred_coords = model(query_imgs, rs_imgs, mat_clickxy)
+            pred_anchor, coords_list = model(query_imgs, rs_imgs, mat_clickxy)
+            
+            # Lấy kết quả refinement cuối cùng làm pred_coords chính thức
+            pred_coords = coords_list[-1] 
+
         pred_anchor = pred_anchor.view(pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3])
         
         _, best_anchor_gi_gj = build_target(ori_gt_bbox, anchors_full, args.img_size, pred_anchor.shape[3])

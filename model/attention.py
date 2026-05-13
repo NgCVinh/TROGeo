@@ -384,3 +384,43 @@ class FeatureGating(nn.Module):
         out = res_ref * (1 + self.gamma * s_weight)
         
         return out
+
+class IterativeRefinementHead(nn.Module):
+    def __init__(self, in_channels, num_steps=3):
+        super().__init__()
+        self.num_steps = num_steps
+        
+        # Mỗi head sẽ có một bộ trọng số riêng để học các mức độ chi tiết khác nhau
+        self.refine_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels, in_channels // 2, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_channels // 2, 1, kernel_size=1) # Dự đoán heatmap/tọa độ
+            ) for _ in range(num_steps)
+        ])
+        
+        # Lớp trung gian để kết hợp thông tin từ dự đoán trước đó
+        self.spatial_process = nn.Sequential(
+            nn.Conv2d(1, 1, kernel_size=7, padding=3),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        outputs = []
+        current_features = x
+        prev_mask = None
+
+        for i in range(self.num_steps):
+            # Nếu đã có dự đoán từ head trước, dùng nó để "ép" head này tập trung vùng đó
+            if prev_mask is not None:
+                current_features = x * (1 + prev_mask)
+            
+            # Dự đoán
+            out = self.refine_layers[i](current_features)
+            outputs.append(out)
+            
+            # Cập nhật mặt nạ dựa trên dự đoán hiện tại cho head tiếp theo
+            # Chúng ta dùng Sigmoid để tạo ra vùng chú ý (Attention Mask)
+            prev_mask = self.spatial_process(out.detach()) # detach để không bị rối gradient giữa các bước
+
+        return outputs # Trả về list 3 kết quả từ thô đến tinh

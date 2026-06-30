@@ -386,7 +386,7 @@ class FeatureGating(nn.Module):
         return out
 
 class IterativeRefinementHead(nn.Module):
-    def __init__(self, in_channels, num_steps=3):
+    def __init__(self, in_channels, num_steps=2):
         super().__init__()
         self.num_steps = num_steps
         
@@ -424,3 +424,4 @@ class IterativeRefinementHead(nn.Module):
             prev_mask = self.spatial_process(out.detach()) # detach để không bị rối gradient giữa các bước
 
         return outputs # Trả về list 3 kết quả từ thô đến tinh
+

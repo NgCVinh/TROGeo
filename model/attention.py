@@ -224,6 +224,7 @@ class CrossAttention(nn.Module):
 
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
 
+
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
             max_neg_value = -torch.finfo(sim.dtype).max
@@ -304,124 +305,50 @@ class SpatialTransformer(nn.Module):
         x = self.proj_out(x)
         return x + x_in
         
-class FeatureGating(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        reduced = in_channels // 8
+   
 
-        # --- Nhánh 1: Channel Gating ---
-        self.channel_gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, reduced, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(reduced, in_channels, 1),
-            nn.Sigmoid()
-        )
-
-        # --- Nhánh 2: Spatial Gating với MULTI-SCALE CONTEXT ---
-        # 3 lăng kính với các trường nhìn (Receptive Fields) khác nhau
-        self.q_proj_1x1 = nn.Conv2d(in_channels, reduced, kernel_size=1)
-        self.q_proj_3x3 = nn.Conv2d(in_channels, reduced, kernel_size=3, padding=1)
-        self.q_proj_3x3_d2 = nn.Conv2d(in_channels, reduced, 3, padding=2, dilation=2)
-        
-        # Trộn các quy mô lại với nhau
-        self.q_combine = nn.Sequential(
-            nn.Conv2d(reduced * 3, reduced, kernel_size=1),
-            nn.BatchNorm2d(reduced),
-            nn.ReLU(inplace=True)
-        )
-
-        self.ref_proj = nn.Conv2d(in_channels, reduced, 1)
-        
-        self.interaction_bn = nn.BatchNorm2d(reduced)
-
-        self.spatial_gate = nn.Sequential(
-            nn.Conv2d(reduced, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-        
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-        self._init_weights()
-
-    def _init_weights(self):
-        # Khởi tạo bias lớp Sigmoid cuối cùng bằng 1 để ban đầu Gating "mở cửa" hoàn toàn
-        # Giúp mô hình không bị mất tín hiệu ở các epoch đầu
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        
-        # Ép Sigmoid ban đầu ra giá trị ~ 1
-        nn.init.constant_(self.channel_gate[-2].weight, 0) # Weight lớp conv cuối = 0
-        # Nếu có bias thì set bias = 1, nếu không có bias (như code trên) thì Sigmoid(0) = 0.5 
-
-    def forward(self, query, reference):
-        # 1. Channel Attention
-        c_weight = self.channel_gate(query)
-        res_ref = reference * c_weight 
-
-        # 2. Spatial Attention (Multi-Scale)
-        # Trích xuất đặc trưng Query ở 3 quy mô khác nhau
-        q_1 = self.q_proj_1x1(query) # Nhìn điểm nhỏ
-        q_3 = self.q_proj_3x3(query) # Nhìn vật thể vừa
-        q_5 = self.q_proj_3x3_d2(query) # Nhìn cấu trúc lớn (nhà, ngã tư)
-        
-        # Ghép lại và trộn
-        q_multi = self.q_combine(torch.cat([q_1, q_3, q_5], dim=1))
-        
-        # Nén thành vector ngữ cảnh toàn cục (đã chứa thông tin đa quy mô)
-        q_avg = F.adaptive_avg_pool2d(q_multi, 1)
-        q_max = F.adaptive_max_pool2d(q_multi, 1)
-        q_context = q_avg + q_max # (B, reduced, 1, 1)
-        
-        r_features = self.ref_proj(res_ref) # (B, reduced, H, W)
-        
-        # Tính tương quan
-        interaction = self.interaction_bn(r_features * q_context)
-        s_weight = self.spatial_gate(interaction) # (B, 1, H, W)
-        
-        # 3. Kết hợp (Residual Connection)
-        out = res_ref * (1 + self.gamma * s_weight)
-        
-        return out
-
-class IterativeRefinementHead(nn.Module):
-    def __init__(self, in_channels, num_steps=2):
-        super().__init__()
+class IterativeBoxRefinementHead(nn.Module):
+    """
+    Cơ chế tinh chỉnh Bounding Box qua nhiều bước (Multi-step Refinement).
+    Đầu ra mỗi bước là dự đoán Box Parameters (Ví dụ: 5 channels tương ứng với YOLO Box hoặc 4 coordinates).
+    """
+    def __init__(self, in_channels, num_anchors=9, num_classes=5, num_steps=2):
+        super(IterativeBoxRefinementHead, self).__init__()
         self.num_steps = num_steps
+        self.num_anchors = num_anchors
+        self.num_classes = num_classes # 5: (x, y, w, h, confidence)
         
-        # Mỗi head sẽ có một bộ trọng số riêng để học các mức độ chi tiết khác nhau
-        self.refine_layers = nn.ModuleList([
+        # Khối Conv trích xuất đặc trưng bổ trợ ở từng bước
+        self.refine_blocks = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(in_channels, in_channels // 2, kernel_size=3, padding=1),
+                nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(in_channels),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(in_channels // 2, 1, kernel_size=1) # Dự đoán heatmap/tọa độ
+                nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(in_channels),
+                nn.ReLU(inplace=True)
             ) for _ in range(num_steps)
         ])
         
-        # Lớp trung gian để kết hợp thông tin từ dự đoán trước đó
-        self.spatial_process = nn.Sequential(
-            nn.Conv2d(1, 1, kernel_size=7, padding=3),
-            nn.Sigmoid()
-        )
+        # Head dự đoán Bounding Box cho từng bước tinh chỉnh
+        self.box_heads = nn.ModuleList([
+            nn.Conv2d(in_channels, num_anchors * num_classes, kernel_size=1)
+            for _ in range(num_steps)
+        ])
 
     def forward(self, x):
-        outputs = []
-        current_features = x
-        prev_mask = None
-
+        coords_list = []
+        feat = x
+        
         for i in range(self.num_steps):
-            # Nếu đã có dự đoán từ head trước, dùng nó để "ép" head này tập trung vùng đó
-            if prev_mask is not None:
-                current_features = x * (1 + prev_mask)
+            feat = self.refine_blocks[i](feat)
+            pred_box = self.box_heads[i](feat)
             
-            # Dự đoán
-            out = self.refine_layers[i](current_features)
-            outputs.append(out)
+            # Reshape về dạng YOLO Box: [B, num_anchors, 5, H, W]
+            B, C, H, W = pred_box.shape
+            pred_box = pred_box.view(B, self.num_anchors, self.num_classes, H, W)
             
-            # Cập nhật mặt nạ dựa trên dự đoán hiện tại cho head tiếp theo
-            # Chúng ta dùng Sigmoid để tạo ra vùng chú ý (Attention Mask)
-            prev_mask = self.spatial_process(out.detach()) # detach để không bị rối gradient giữa các bước
-
-        return outputs # Trả về list 3 kết quả từ thô đến tinh
+            coords_list.append(pred_box)
+            
+        return coords_list
 

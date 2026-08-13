@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from einops import rearrange
 import torchvision.models as models
 
-from model.attention import SpatialTransformer, FeatureGating, IterativeRefinementHead
+from model.attention import SpatialTransformer
 
 def double_conv(in_channels, out_channels):
     return nn.Sequential(
@@ -13,95 +13,128 @@ def double_conv(in_channels, out_channels):
         nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
     )
 
-class SwinSBackbone(nn.Module):
+
+class SwinTBackbone(nn.Module):
+    """Backbone trích xuất đặc trưng sử dụng Swin-Tiny (Swin-T)."""
+
     def __init__(self):
-        super(SwinSBackbone, self).__init__()
-        # Trích xuất đặc trưng tiêu chuẩn từ mô hình pre-train
-        base_model = models.swin_s(weights=models.Swin_S_Weights.IMAGENET1K_V1)
+        super(SwinTBackbone, self).__init__()
+        base_model = models.swin_t(weights=models.Swin_T_Weights.IMAGENET1K_V1)
         self.features = base_model.features
 
     def forward(self, x):
-        # Đầu ra gốc: [B, H/32, W/32, 768] -> Chuyển về chuẩn: [B, 768, H/32, W/32]
         x = self.features(x)
         return x.permute(0, 3, 1, 2).contiguous()
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+import torchvision.models as models
+
+from model.attention import SpatialTransformer
+
+class SegToLocTokenFusion(nn.Module):
+    def __init__(self, channels, num_tokens=8, num_heads=12):
+        super(SegToLocTokenFusion, self).__init__()
+        self.num_tokens = num_tokens
+        
+        # 1. Learnable Object Queries dùng để nén f_seg thành K Object Tokens
+        self.object_queries = nn.Parameter(torch.randn(1, num_tokens, channels))
+        
+        # 2. Tokenization: Gom f_seg [B, HW, C] về K Object Tokens [B, K, C]
+        self.mha_seg = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
+        self.norm_seg = nn.LayerNorm(channels)
+        
+        # 3. Thay MHA bằng SpatialTransformer chính chủ của bạn
+        # f_bbox (2D) làm `x`, object_tokens làm `context`
+        self.spatial_transformer_loc = SpatialTransformer(
+            in_channels=channels, 
+            n_heads=num_heads, 
+            d_head=channels // num_heads, 
+            depth=1, 
+            context_dim=channels
+        )
+        
+        # 4. Zero-Gating Residual Connection bảo vệ Baseline
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, f_seg, f_bbox):
+        """
+        f_seg: [B, C, H, W]
+        f_bbox: [B, C, H, W]
+        """
+        B, C, H, W = f_bbox.shape
+        
+        # Step 1: Nén f_seg thành K Object Tokens [B, K, C]
+        flat_seg = f_seg.flatten(2).transpose(1, 2)  # [B, H*W, C]
+        q_obj = self.object_queries.expand(B, -1, -1)  # [B, K, C]
+        
+        obj_tokens, _ = self.mha_seg(query=q_obj, key=flat_seg, value=flat_seg)
+        obj_tokens = self.norm_seg(obj_tokens)  # [B, K, C]
+        
+        # Step 2: f_bbox tương tác với K Object Tokens qua SpatialTransformer
+        # x = f_bbox [B, C, H, W], context = obj_tokens [B, K, C]
+        enhanced_bbox = self.spatial_transformer_loc(x=f_bbox, context=obj_tokens)
+        
+        # Step 3: Zero-Gated Residual Fusion
+        f_fused_bbox = f_bbox + self.gamma * enhanced_bbox
+        return f_fused_bbox
+
 class TROGeo(nn.Module):
-    def __init__(self, emb_size=768):
+    def __init__(self, emb_size=768, num_object_tokens=8):
         super(TROGeo, self).__init__()
 
-        # 1. Khởi tạo Backbone Swin-S dùng chung để tiết kiệm bộ nhớ
-        self.backbone = SwinSBackbone()
+        base_model = SwinTBackbone()
+        self.query_model = base_model
+        self.reference_model = base_model
+        self.combine_clickptns_conv = double_conv(4, 3)
         
-        # 2. TÁCH BIỆT: Khối tích hợp 4 kênh (RGB + Click Point) độc lập cho 2 nhánh nhiệm vụ
-        self.combine_box_click = double_conv(4, 3)  # Dành cho nhánh học cấu trúc Bounding Box
-        self.combine_seg_click = double_conv(4, 3)  # Dành cho nhánh học ranh giới mịn (Segmentation)
+        # Nhánh hỗ trợ thông tin Seg -> Loc TRƯỚC khi Cross-Attention với Reference (Cách 1)
+        self.seg_to_loc_fusion = SegToLocTokenFusion(channels=emb_size, num_tokens=num_object_tokens, num_heads=12)
 
-        # 3. Các module Attention và Gating
-        self.gating = FeatureGating(in_channels=emb_size)
-        self.cross_attention = SpatialTransformer(in_channels=emb_size, n_heads=12, d_head=64, depth=1, context_dim=emb_size)
+        # Spatial Transformers (Cross-Attention với Reference)
+        self.cross_attention_seg = SpatialTransformer(in_channels=emb_size, n_heads=12, d_head=64, depth=1, context_dim=emb_size)
+        self.cross_attention_loc = SpatialTransformer(in_channels=emb_size, n_heads=12, d_head=64, depth=1, context_dim=emb_size)
 
-        # 4. Mạch giải nén không gian tuần tự (Từ 1/32 lên 1/16 rồi lên 1/8) cho đầu Refinement
-        self.upsample = nn.Sequential(
-            nn.ConvTranspose2d(emb_size, emb_size // 2, kernel_size=4, stride=2, padding=1), 
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(emb_size // 2, emb_size // 4, kernel_size=4, stride=2, padding=1) 
-        )
-        self.iterative_coords = IterativeRefinementHead(in_channels=emb_size // 4, num_steps=2)
-        
-        # 5. Head dự đoán Bounding Box nguyên bản từ đặc trưng thô
-        self.fcn_out = nn.Sequential(
+        # Head dự đoán Bounding Box (45 channels = 9 anchors * 5 params)
+        self.fcn_out_box = nn.Sequential(
             nn.ConvTranspose2d(in_channels=emb_size, out_channels=emb_size // 2, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(emb_size // 2, 45, kernel_size=1),
         )
-        self.coodrs_out = nn.Sequential(
+
+        # Head dự đoán Mask
+        self.fcn_out_mask = nn.Sequential(
             nn.ConvTranspose2d(in_channels=emb_size, out_channels=emb_size // 2, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(emb_size // 2, 1, kernel_size=1),
+            nn.Conv2d(emb_size // 2, 1, kernel_size=1)
         )
 
-    def forward(self, query_imgs, reference_imgs, click_box_mask, click_seg_heatmap):
-        """
-        Args:
-            query_imgs: Ảnh Drone [B, 3, 1024, 1024]
-            reference_imgs: Ảnh Vệ tinh [B, 3, 1024, 1024]
-            click_box_mask: Tensor nhị phân vùng bao của điểm click [B, 1024, 1024]
-            click_seg_heatmap: Tensor Gaussian loang mờ của điểm click [B, 1024, 1024]
-        """
-        # --- BƯỚC 1: TRÍCH XUẤT ĐẶC TRƯNG ĐƠN LẺ CHO ẢNH VỆ TINH ---
-        r_feat = self.backbone(reference_imgs) # Kích thước chuẩn: [B, 768, 32, 32]
-
-        # Chuẩn bị chiều không gian cho các bản đồ Click Point [B, 1024, 1024] -> [B, 1, 1024, 1024]
-        click_box_mask = click_box_mask.unsqueeze(1)
-        click_seg_heatmap = click_seg_heatmap.unsqueeze(1)
-
-        # --- BƯỚC 2: NHÁNH DỰ ĐOÁN BOUNDING BOX (BOX BRANCH) ---
-        # Hòa trộn ảnh Drone với mặt nạ vùng bao (Box Mask)
-        q_box_input = self.combine_box_click(torch.cat((query_imgs, click_box_mask), dim=1))
-        q_box_feat = self.backbone(q_box_input)
+    def forward(self, query_imgs, reference_imgs, mat_clickptns):
+        # 1. Trích xuất đặc trưng từ Backbone
+        mat_clickptns = mat_clickptns.unsqueeze(1)
+        query_imgs = self.combine_clickptns_conv(torch.cat((query_imgs, mat_clickptns), dim=1))
         
-        # Ép đặc trưng Box của Drone với ảnh Vệ tinh qua Gating & Cross-Attention
-        #r_feat_gated_box = self.gating(q_box_feat, r_feat)
-        context_box = rearrange(q_box_feat, 'b c h w -> b (h w) c').contiguous()
+        q_feat = self.query_model(query_imgs)  # [B, C, H, W]
+        r_feat = self.reference_model(reference_imgs)  # [B, C, H, W]
 
-        #fused_box = self.cross_attention(x=r_feat_gated_box, context=context_box)
-        fused_box = self.cross_attention(x=r_feat, context=context_box)
-        # Xuất kết quả dự đoán Box
-        outbox = self.fcn_out(fused_box)
+        # Khởi tạo đặc trưng phân nhánh từ Reference Backbone
+        f_seg = r_feat
+        f_bbox = r_feat
 
-        # --- BƯỚC 3: NHÁNH TINH CHỈNH TỌA ĐỘ / PHÂN VÙNG (REFINEMENT BRANCH) ---
-        # Hòa trộn ảnh Drone với bản đồ Gaussian mịn (Segmentation Heatmap)
-        q_seg_input = self.combine_seg_click(torch.cat((query_imgs, click_seg_heatmap), dim=1))
-        q_seg_feat = self.backbone(q_seg_input)
+        # 2. Nhánh Seg hỗ trợ thông tin cho Bbox TRƯỚC khi Cross-Attention với Reference
+        f_fused_bbox = self.seg_to_loc_fusion(f_seg=f_seg, f_bbox=f_bbox)
+
+        # 3. Cross-Attention với Query Context
+        context = rearrange(q_feat, 'b c h w -> b (h w) c').contiguous()
         
-        # Ép đặc trưng Phân vùng của Drone với ảnh Vệ tinh qua Gating & Cross-Attention
-        #r_feat_gated_seg = self.gating(q_seg_feat, r_feat)
-        context_seg = rearrange(q_seg_feat, 'b c h w -> b (h w) c').contiguous()
-        fused_seg = self.cross_attention(x=r_feat, context=context_seg)
-        
-        # Phóng đại độ phân giải đặc trưng tuần tự và đưa qua Iterative Refinement nắn tọa độ
-        #fused_high_res = self.upsample(fused_seg)
-        #coords_list = self.iterative_coords(fused_high_res)
-        coodrs = self.coodrs_out(fused_seg)
-        return outbox, coodrs
+        seg_features = self.cross_attention_seg(x=f_seg, context=context)
+        loc_features = self.cross_attention_loc(x=f_fused_bbox, context=context)
+
+        # 4. Dự đoán đầu ra
+        pred_box = self.fcn_out_box(loc_features)
+        pred_mask = self.fcn_out_mask(seg_features)
+
+        return pred_box, pred_mask

@@ -154,35 +154,34 @@ def main():
         # logging.info('\nBest Accu: %f\n'%best_accu)
 
 def train_epoch(train_loader, model, optimizer, epoch, criterion, args):
+    torch.cuda.empty_cache()
+
     batch_time = AverageMeter()
     avg_losses = AverageMeter()
-    avg_geo_losses = AverageMeter()
     avg_cls_losses = AverageMeter()
-    avg_iou = AverageMeter()
+    avg_geo_losses = AverageMeter()
     avg_accu = AverageMeter()
     avg_accu_center = AverageMeter()
+    avg_iou = AverageMeter()
 
     model.train()
     end = time.time()
-
     anchors_full = np.array([float(x.strip()) for x in args.anchors.split(',')])
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
     anchors_full = torch.tensor(anchors_full, dtype=torch.float32).cuda()
 
-    # CẢI TIẾN: Unpack đủ 6 đầu ra từ Dataset mới
-    for batch_idx, (query_imgs, rs_imgs, click_box_mask, click_seg_heatmap, ori_gt_bbox, mask_rsimg) in enumerate(train_loader):
+    for batch_idx, (query_imgs, rs_imgs, mat_clickxy, ori_gt_bbox, mask_rsimg) in enumerate(train_loader):
         query_imgs, rs_imgs = query_imgs.cuda(), rs_imgs.cuda()
-        click_box_mask = click_box_mask.cuda()
-        click_seg_heatmap = click_seg_heatmap.cuda()
+        mat_clickxy = mat_clickxy.cuda()
         ori_gt_bbox = ori_gt_bbox.cuda()
         ori_gt_bbox = torch.clamp(ori_gt_bbox, min=0, max=args.img_size-1)
 
         mask_rsimg = mask_rsimg.unsqueeze(1)
+        # coords_gt = nn.AvgPool2d(16, stride=16)(mask_rsimg)
         coords_gt = nn.MaxPool2d(16, stride=16)(mask_rsimg)
         coords_gt = coords_gt.cuda()
 
-        # CẢI TIẾN: Đưa cả 2 loại mặt nạ Click Point vào mô hình
-        pred_anchor, pred_coords = model(query_imgs, rs_imgs, click_box_mask, click_seg_heatmap)
+        pred_anchor, pred_coords = model(query_imgs, rs_imgs, mat_clickxy)
 
         pred_anchor = pred_anchor.view(pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3])
         
@@ -191,12 +190,11 @@ def train_epoch(train_loader, model, optimizer, epoch, criterion, args):
         
         # loss
         loss_geo, loss_cls = yolo_loss(pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, args.img_size)
-        
-        # Tính toán loss kết hợp đa nhiệm
         loss = loss_cls + loss_geo * args.beta + criterion(pred_coords, coords_gt) * 2.
 
         optimizer.zero_grad()
         loss.backward()
+
         optimizer.step()
 
         avg_losses.update(loss.item(), query_imgs.shape[0])
@@ -205,7 +203,6 @@ def train_epoch(train_loader, model, optimizer, epoch, criterion, args):
         
         accu_list, accu_center, iou, _, _, _ = eval_iou_acc(pred_anchor, ori_gt_bbox, anchors_full, best_anchor_gi_gj[:, 1], best_anchor_gi_gj[:, 2], args.img_size, iou_threshold_list=[0.5])
         accu = accu_list[0]
-        
         ## metrics
         avg_iou.update(iou, query_imgs.shape[0])
         avg_accu.update(accu, query_imgs.shape[0])
@@ -228,7 +225,7 @@ def train_epoch(train_loader, model, optimizer, epoch, criterion, args):
                     epoch, batch_idx, len(train_loader), batch_time=batch_time, \
                     loss=avg_losses, geo=avg_geo_losses, cls=avg_cls_losses, accu=avg_accu, miou=avg_iou, accu_c=avg_accu_center)
             print(print_str)
-
+            # logging.info(print_str)
 
 def test_epoch(data_loader, model, args):
     batch_time = AverageMeter()
@@ -240,23 +237,19 @@ def test_epoch(data_loader, model, args):
     torch.cuda.empty_cache()
     model.eval()
     end = time.time()
-
+    #print(datetime.datetime.now())
     anchors_full = np.array([float(x.strip()) for x in args.anchors.split(',')])
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
     anchors_full = torch.tensor(anchors_full, dtype=torch.float32).cuda()
 
-    # CẢI TIẾN: Nhận đủ cấu trúc dữ liệu kiểm thử (6 tham số) từ DataLoader
-    for batch_idx, (query_imgs, rs_imgs, click_box_mask, click_seg_heatmap, ori_gt_bbox, _) in enumerate(data_loader):
+    for batch_idx, (query_imgs, rs_imgs, mat_clickxy, ori_gt_bbox, _) in enumerate(data_loader):
         query_imgs, rs_imgs = query_imgs.cuda(), rs_imgs.cuda()
-        click_box_mask = click_box_mask.cuda()
-        click_seg_heatmap = click_seg_heatmap.cuda()
+        mat_clickxy = mat_clickxy.cuda()
         ori_gt_bbox = ori_gt_bbox.cuda()
         ori_gt_bbox = torch.clamp(ori_gt_bbox, min=0, max=args.img_size-1)
 
         with torch.no_grad():
-            # CẢI TIẾN: Đồng bộ tham số đầu vào cho mô hình kiểm thử
-            pred_anchor, pred_coords = model(query_imgs, rs_imgs, click_box_mask, click_seg_heatmap)
-            
+            pred_anchor, pred_coords = model(query_imgs, rs_imgs, mat_clickxy)
         pred_anchor = pred_anchor.view(pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3])
         
         _, best_anchor_gi_gj = build_target(ori_gt_bbox, anchors_full, args.img_size, pred_anchor.shape[3])
@@ -283,11 +276,15 @@ def test_epoch(data_loader, model, args):
                     batch_idx, len(data_loader), batch_time=batch_time, \
                     accu50=avg_accu50, accu25=avg_accu25, miou=avg_iou, accu_c=avg_accu_center)
             print(print_str)
-
+            # logging.info(print_str)
+    # print(avg_accu50.avg, avg_accu25.avg, avg_iou.avg, avg_accu_center.avg)
     print_str = f"Accu50: {avg_accu50.avg:.5f}, Accu25: {avg_accu25.avg:.5f}, mIoU: {avg_iou.avg:.5f}, Accu Center: {avg_accu_center.avg:.5f}"
     print(print_str)
 
+    # logging.info("%f, %f, %f, %f" % (avg_accu50.avg, avg_accu25.avg, float(avg_iou.avg), avg_accu_center.avg))
+
     return avg_accu50.avg
+
 
 if __name__ == "__main__":
     main()

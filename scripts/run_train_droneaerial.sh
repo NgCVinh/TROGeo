@@ -1,1 +1,1 @@
-python -u train.py --emb_size 768 --img_size 1024 --max_epoch 25 --data_root /home/aiplatform/object-detection/CVOS-Code/dataset --data_name CVOGL_DroneAerial --beta 1.0 --savename CVOS_2_branch_click_point --gpu 0 --batch_size 6 --num_workers 0 --print_freq 50
+python -u train.py --emb_size 768 --img_size 1024 --max_epoch 25 --data_root /home/aiplatform/object-detection/CVOS-Code/dataset --data_name CVOGL_DroneAerial --beta 1.0 --savename CVOS_LE_SA --gpu 0 --batch_size 6 --num_workers 0 --print_freq 50

@@ -1,0 +1,7 @@
+----------------------------------------------------------------------
+train.py
+Namespace(gpu='0', num_workers=0, max_epoch=25, lr=0.0001, batch_size=6, emb_size=768, img_size=1024, data_root='/workspace/Object Detection/TROGeo/dataset', data_name='CVOGL_DroneAerial', pretrain='', print_freq=50, savename='baseline', seed=2024, beta=1.0, pos_weight=15.0, test=False, val=False)
+----------------------------------------------------------------------
+Num of parameters: 49965931
+('lr', 0.0001)
+Epoch: [0][0/724]	Time 2.308 (2.308)	Loss 13.2485 (13.2485)	Geo Loss 0.9186 (0.9186)	Cls Loss 10.4840 (10.4840)	Accu 0.0000 (0.0000)	Mean_iou 0.0618 (0.0618)	Accu_c 0.0000 (0.0000)	

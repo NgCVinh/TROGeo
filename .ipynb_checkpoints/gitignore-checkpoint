@@ -27,10 +27,4 @@ runs/
 
 # OS / IDE
 .vscode/
-.DS_Storedataset/CVOGL_DroneAerial/
-error_analysis/ dataset/CVOGL_DroneAerial/
-error_analysis/
-dataset/CVOGL_DroneAerial/
-error_analysis/
-dataset/CVOGL_DroneAerial/
-error_analysis/
+.DS_Store

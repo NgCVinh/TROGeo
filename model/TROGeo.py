@@ -30,13 +30,13 @@ class TROGeo(nn.Module):
     def __init__(self, emb_size=768):
         super(TROGeo, self).__init__()
 
-        # Backbone
+        # 1. Backbone & Input Prep
         base_model = SwinTBackbone()
         self.query_model = base_model
         self.reference_model = base_model
         self.combine_clickptns_conv = double_conv(4, 3)
 
-        # Spatial Transformers (Cross-Attention với Query)
+        # 2. Spatial Transformers (Cross-Attention)
         self.cross_attention_seg = SpatialTransformer(
             in_channels=emb_size, n_heads=12, d_head=64, depth=1, context_dim=emb_size
         )
@@ -44,6 +44,7 @@ class TROGeo(nn.Module):
             in_channels=emb_size, n_heads=12, d_head=64, depth=1, context_dim=emb_size
         )
 
+        # 3. Mask Refinement & Gate
         self.refine_mask = nn.Sequential(
             nn.Conv2d(emb_size, emb_size // 4, kernel_size=3, padding=1),
             nn.BatchNorm2d(emb_size // 4),
@@ -60,8 +61,23 @@ class TROGeo(nn.Module):
             nn.Sigmoid()
         )
 
-        # Head dự đoán Bounding Box
-        self.fcn_out_box = nn.Sequential(
+        # --- HTC SPECIFIC MODULES (Khối tích hợp đặc trưng từ HTC) ---
+        # Mask-to-Box Feature Integration Block: Chuyển đổi f_seg thành Feature cùng kích thước loc_features
+        self.mask_to_box_flow = nn.Sequential(
+            nn.Conv2d(emb_size, emb_size, kernel_size=3, padding=1),
+            nn.BatchNorm2d(emb_size),
+            nn.ReLU(inplace=True)
+        )
+
+        # Head dự đoán Bounding Box Stage 1 (Coarse Box)
+        self.fcn_out_box_stage1 = nn.Sequential(
+            nn.ConvTranspose2d(in_channels=emb_size, out_channels=emb_size // 2, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(emb_size // 2, 45, kernel_size=1),
+        )
+
+        # Head dự đoán Bounding Box Stage 2 (Refined Box theo HTC Style)
+        self.fcn_out_box_stage2 = nn.Sequential(
             nn.ConvTranspose2d(in_channels=emb_size, out_channels=emb_size // 2, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(emb_size // 2, 45, kernel_size=1),
@@ -79,25 +95,40 @@ class TROGeo(nn.Module):
         mat_clickptns = mat_clickptns.unsqueeze(1)
         query_imgs = self.combine_clickptns_conv(torch.cat((query_imgs, mat_clickptns), dim=1))
         
-        q_feat = self.query_model(query_imgs)        # [B, C, H, W] -> (B, 768, 8, 8)
-        r_feat = self.reference_model(reference_imgs)  # [B, C, H, W] -> (B, 768, 32, 32)
+        q_feat = self.query_model(query_imgs)        # [B, C, H, W]
+        r_feat = self.reference_model(reference_imgs)  # [B, C, H, W]
 
-        # Chuẩn bị Query context cho Cross-Attention
+        # Chuẩn bị Query context
         context = rearrange(q_feat, 'b c h w -> b (h w) c').contiguous()
 
-        # 2. Nhánh Cross-Attention Segmentation trước
+        # 2. Nhánh Segmentation 
         f_seg = self.cross_attention_seg(x=r_feat, context=context) # [B, C, H, W]
+        pred_mask = self.fcn_out_mask(f_seg)                          # [B, 1, H_mask, W_mask]
 
-        # 3. Tạo Soft Mask từ f_seg
-        m_seg = self.refine_mask(f_seg) # [B, 1, H, W]
-
+        # 3. Nhánh Localization cơ bản
+        m_seg = self.refine_mask(f_seg) 
         gate_spatial = self.gate_generator(torch.cat([r_feat, f_seg], dim=1))
         r_feat_context_seg = r_feat * ((1.0 - gate_spatial) + gate_spatial * m_seg)
-        # 5. Cross-Attention cho Localization với Feature đã được làm nổi bật vùng tương đồng
-        loc_features = self.cross_attention_loc(x=r_feat_context_seg, context=context)
+        
+        loc_features_stage1 = self.cross_attention_loc(x=r_feat_context_seg, context=context) # [B, C, H, W]
 
-        # 6. Dự đoán đầu ra
-        pred_box = self.fcn_out_box(loc_features)
-        pred_mask = self.fcn_out_mask(f_seg)
+        # Dự đoán Box Stage 1 (Dạng thô - dễ bị lỗi co cụm như ảnh của bạn)
+        pred_box_stage1 = self.fcn_out_box_stage1(loc_features_stage1)
 
-        return pred_box, pred_mask
+        # --- TƯ DUY HYBRID TASK CASCADE (HTC): MASK FEATURE FLOW ---
+        # A. Trích xuất thông tin ngữ nghĩa & ranh giới từ f_seg
+        mask_feat_flow = self.mask_to_box_flow(f_seg) # [B, C, H, W]
+
+        # B. Dung hợp (Fusion) trực tiếp Mask Feature vào Loc Features (Dạng Residual Integration)
+        loc_features_stage2 = loc_features_stage1 + mask_feat_flow
+
+        # C. Dự đoán Box Stage 2 (Dự đoán lại dựa trên feature đã được Mask mở rộng)
+        pred_box_stage2 = self.fcn_out_box_stage2(loc_features_stage2)
+        # -------------------------------------------------------------
+
+        if self.training:
+            # Khi Train: Trả về cả 2 stages để tính Multi-stage Loss (Giúp hội tụ cực nhanh)
+            return pred_box_stage1, pred_box_stage2, pred_mask
+        else:
+            # Khi Inference/Eval: Chỉ lấy kết quả đã tinh chỉnh tốt nhất ở Stage 2
+            return pred_box_stage2, pred_mask

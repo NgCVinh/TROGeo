@@ -31,9 +31,11 @@ class TROGeo(nn.Module):
         super(TROGeo, self).__init__()
 
         # Backbone
-        base_model = SwinTBackbone()
-        self.query_model = base_model
-        self.reference_model = base_model
+        self.base_model = SwinTBackbone()
+        #base_model = SwinTBackbone()
+        self.query_model_segmentation = self.base_model
+        self.query_model_localization = SwinTBackbone()
+        self.reference_model = self.base_model
         self.combine_clickptns_conv = double_conv(4, 3)
 
         # Spatial Transformers (Cross-Attention với Query)
@@ -79,22 +81,23 @@ class TROGeo(nn.Module):
         mat_clickptns = mat_clickptns.unsqueeze(1)
         query_imgs = self.combine_clickptns_conv(torch.cat((query_imgs, mat_clickptns), dim=1))
         
-        q_feat = self.query_model(query_imgs)        # [B, C, H, W] -> (B, 768, 8, 8)
+        q_feat_seg = self.query_model_segmentation(query_imgs)        # [B, C, H, W] -> (B, 768, 8, 8)
+        q_feat_loc = self.query_model_localization(query_imgs)
         r_feat = self.reference_model(reference_imgs)  # [B, C, H, W] -> (B, 768, 32, 32)
 
         # Chuẩn bị Query context cho Cross-Attention
-        context = rearrange(q_feat, 'b c h w -> b (h w) c').contiguous()
-
+        context_seg = rearrange(q_feat_seg, 'b c h w -> b (h w) c').contiguous()
+        context_loc = rearrange(q_feat_loc, 'b c h w -> b (h w) c').contiguous()
         # 2. Nhánh Cross-Attention Segmentation trước
-        f_seg = self.cross_attention_seg(x=r_feat, context=context) # [B, C, H, W]
+        f_seg = self.cross_attention_seg(x=r_feat, context=context_seg) # [B, C, H, W]
 
         # 3. Tạo Soft Mask từ f_seg
         m_seg = self.refine_mask(f_seg) # [B, 1, H, W]
 
         gate_spatial = self.gate_generator(torch.cat([r_feat, f_seg], dim=1))
-        r_feat_context_seg = r_feat * ((1.0 - gate_spatial) + gate_spatial * m_seg)
+        r_feat_context_seg = r_feat * (1.0 + gate_spatial * m_seg)
         # 5. Cross-Attention cho Localization với Feature đã được làm nổi bật vùng tương đồng
-        loc_features = self.cross_attention_loc(x=r_feat_context_seg, context=context)
+        loc_features = self.cross_attention_loc(x=r_feat_context_seg, context=context_loc)
 
         # 6. Dự đoán đầu ra
         pred_box = self.fcn_out_box(loc_features)

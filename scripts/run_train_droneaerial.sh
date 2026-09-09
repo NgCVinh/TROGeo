@@ -1,1 +1,1 @@
-python -u train.py --emb_size 768 --img_size 1024 --max_epoch 25 --data_root "/workspace/Object Detection/TROGeo/dataset" --data_name CVOGL_DroneAerial --beta 1.0 --savename CVOS_STL_mask_param --gpu 0 --batch_size 6 --num_workers 0 --print_freq 50
+python -u train.py --emb_size 768 --img_size 1024 --max_epoch 25 --data_root "/workspace/Object Detection/TROGeo/dataset" --data_name CVOGL_DroneAerial --beta 1.0 --savename CVOS_STL_mask_param_HTC --gpu 0 --batch_size 6 --num_workers 0 --print_freq 50

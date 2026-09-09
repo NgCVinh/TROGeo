@@ -183,15 +183,21 @@ def train_epoch(train_loader, model, optimizer, epoch, criterion, args):
         coords_gt = nn.MaxPool2d(16, stride=16)(mask_rsimg)
         coords_gt = coords_gt.cuda()
 
-        pred_anchor, pred_coords = model(query_imgs, rs_imgs, mat_clickxy)
+        pred_anchor_s1, pred_anchor_s2, pred_coords = model(query_imgs, rs_imgs, mat_clickxy)
 
-        pred_anchor = pred_anchor.view(pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3])
+        pred_anchor_s1 = pred_anchor_s1.view(pred_anchor_s1.shape[0], 9, 5, pred_anchor_s1.shape[2], pred_anchor_s1.shape[3])
+        pred_anchor_s2 = pred_anchor_s2.view(pred_anchor_s2.shape[0], 9, 5, pred_anchor_s2.shape[2], pred_anchor_s2.shape[3])
         
         ## convert gt box to center+offset format
-        new_gt_bbox, best_anchor_gi_gj = build_target(ori_gt_bbox, anchors_full, args.img_size, pred_anchor.shape[3])
+        new_gt_bbox, best_anchor_gi_gj = build_target(ori_gt_bbox, anchors_full, args.img_size, pred_anchor_s2.shape[3])
         
         # loss
-        loss_geo, loss_cls = yolo_loss(pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, args.img_size)
+        loss_geo_s1, loss_cls_s1 = yolo_loss(pred_anchor_s1, new_gt_bbox, anchors_full, best_anchor_gi_gj, args.img_size)
+        loss_geo_s2, loss_cls_s2 = yolo_loss(pred_anchor_s2, new_gt_bbox, anchors_full, best_anchor_gi_gj, args.img_size)
+
+        loss_geo = 0.5 * loss_geo_s1 + 1.0 * loss_geo_s2
+        loss_cls = 0.5 * loss_cls_s1 + 1.0 * loss_cls_s2
+        
         loss = loss_cls + loss_geo * args.beta + criterion(pred_coords, coords_gt) * 2.
 
         optimizer.zero_grad()
@@ -200,10 +206,14 @@ def train_epoch(train_loader, model, optimizer, epoch, criterion, args):
         optimizer.step()
 
         avg_losses.update(loss.item(), query_imgs.shape[0])
-        avg_geo_losses.update(loss_geo.item(), query_imgs.shape[0])
-        avg_cls_losses.update(loss_cls.item(), query_imgs.shape[0])
+        avg_geo_losses.update(loss_geo_s2.item(), query_imgs.shape[0])
+        avg_cls_losses.update(loss_cls_s2.item(), query_imgs.shape[0])
         
-        accu_list, accu_center, iou, _, _, _ = eval_iou_acc(pred_anchor, ori_gt_bbox, anchors_full, best_anchor_gi_gj[:, 1], best_anchor_gi_gj[:, 2], args.img_size, iou_threshold_list=[0.5])
+        accu_list, accu_center, iou, _, _, _ = eval_iou_acc(
+            pred_anchor_s2, ori_gt_bbox, anchors_full, 
+            best_anchor_gi_gj[:, 1], best_anchor_gi_gj[:, 2], 
+            args.img_size, iou_threshold_list=[0.5]
+        )
         accu = accu_list[0]
         ## metrics
         avg_iou.update(iou, query_imgs.shape[0])
